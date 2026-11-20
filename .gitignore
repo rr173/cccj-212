@@ -1,0 +1,8 @@
+# 大资料一律不入库：CSV、SQLite 库及其 WAL/SHM、压测报告
+data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+.pytest_cache/
