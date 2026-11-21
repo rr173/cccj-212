@@ -28,6 +28,17 @@ assembler/            生产装配器（仅用 Python 标准库 + SQLite）
   labels.py           固定 K 的覆盖闭合判定、标签与证据、pending 统计
   pipeline.py         装配编排、构建绑定、按 example_id 回查
   integers.py         int64 边界检查、不溢出的精确整数求和
+splitter/             多折分组/时间隔离切分器（只读装配库，独立切分库）
+  source.py           只读接入(mode=ro)、完整性校验、来源内容指纹
+  inputs.py           切分计划/别名边的严格校验与两遍流式扫描
+  graph.py            紧凑 array CSR、并查集、折段事件、确定性 BFS 路径
+  store.py            切分库 schema、阶段 checkpoint、只读打开
+  pipeline.py         流式构建、状态分类、导出/回查/统计/来源核对
+  integers.py         int64 边界与不回绕的端点算术
+splitter_acceptance/  独立逐折枚举 oracle + 12 组切分验收
+  manual_oracle.py    纯 Python 邻接集合 + BFS，不调用生产分组/折调度
+  test_splits.py      四端点/替代路径/embargo/pending/同名异类等
+splitter_benchmark/   64 折、12 万样本、百万来路、25 万别名边压测
 acceptance/           独立验收（手算 oracle，不调用生产版本选择/窗口索引）
   manual_oracle.py    纯 Python 逐锚点/逐 K 枚举实现
   test_acceptance.py  17 组验收测试
@@ -87,6 +98,75 @@ python3 -I benchmark/run_benchmark.py
 
 建议始终用 `python3 -I` 运行，避免当前目录/站点包中的同名模块被植入加载。
 
+## 多折切分器（分组隔离 + 时间隔离）
+
+在**只读**的已完成装配库上，按切分计划产出独立 SQLite 切分库。不训练、
+不重算特征或标签；同一份装配库可服务不同切分计划。失败只丢弃
+`.building` 临时库，旧切分库与来源库都不受影响。
+
+### 关系证据（只信装配库实际记录的行）
+
+* 样本连到自己的实体（同实体边）；同一 `fact_id` 连到所有在
+  `feature_provenance` 引用它的样本，**哪怕引用的是不同修订**；
+  关系按 `(样本,事实)` 去重，但回查逐跳点名两端真实的特征与修订，
+  不会把两个修订合并成伪造的单条来路。
+* 不从值相等、结局、原始事实全集或 `is_latest` 额外推断。
+* 样本/实体/事实是三类命名空间，库内统一映射为带 `kind` 的整数节点。
+* 折外、pending、隔离区样本仍能当关系中间点。
+
+### 时效别名边
+
+别名文件列 `link_id,left_entity,right_entity,valid_from,valid_to`，
+无向、`link_id` 唯一、区间非空、平行边独立、实体可只出现在别名文件。
+每折独立 `link_at`，仅 `valid_from <= link_at < valid_to` 的边生效，
+在当折全部活跃边上求传递连通；一条边过期不一定拆开两组，只有不存在
+替代路径时才拆开。重复 ID/空区间/非法输入一律拒绝。
+
+### 每折每样本恰一态（折间独立）
+
+`outside` / `pending` / `eval` / `embargo` / `related_eval` / `train`。
+embargo 看观察末点 `cutoff+horizon`（含末点）是否不严格早于
+`eval_from-gap`，标签为 0 也不豁免，且 embargo 优先于关联性判定；
+pending 验证候选不充当对手但仍作中间点；不删验证样本挽救训练行。
+所有时间按 int64 精确算术，端点越界报错，不回绕、不转浮点。
+
+### CLI 与可脚本调用的操作
+
+```bash
+# 构建（先写 .building，成功后原子替换；失败不破坏旧库）
+python3 -I run_splitter.py build --db data/splits.db \
+    --assembly data/run.db --plan data/folds.csv --aliases data/links.csv
+# 按折导出 train / eval 的 example_id
+python3 -I run_splitter.py export --db data/splits.db --fold f0 --state train
+# 按折按样本回查（embargo 给观察末点与界线；related_eval 给最小对手与真实路径）
+python3 -I run_splitter.py lookup --db data/splits.db --fold f0 --example T
+# 按折统计各状态（outside 也精确计数）
+python3 -I run_splitter.py stats --db data/splits.db
+# 核对装配资料/计划/别名输入（重算内容指纹，换库无法冒充旧清单来源）
+python3 -I run_splitter.py verify --db data/splits.db \
+    --assembly data/run.db --plan data/folds.csv --aliases data/links.csv
+```
+
+### 确定性与内存结构
+
+* 节点/边/折均按字节序确定编号，换输入行序、折执行顺序或重开产物，
+  清单、计数、选中对手与回查路径都不变（压测中做过逐行重建比对）。
+* 邻接用紧凑 `array` CSR、并查集用 `array`，Python 侧不缓存全量边；
+  来路与别名边流式两遍扫描；共享事实是星形，从不展开成样本两两配对。
+* 别名边每条仅两次二分定位其命中折段，长期边只在首折 union 一次，
+  不为每折重读装配来路或重扫全部长期活跃别名。
+* 切分库自洽：查询/导出/回查不依赖原文件路径，未拷贝特征值、结局、
+  原始事实；只保存切分必需的节点、去重关系、来路证据、计划、状态与绑定。
+
+### 切分验收与 64 折压测
+
+```bash
+python3 -I examples/run_split_walkthrough.py     # 题面四端点+替代路径小演练
+python3 -I splitter_acceptance/test_splits.py    # 12 组，独立 oracle 逐折枚举
+python3 -I splitter_benchmark/run_split_benchmark.py  # 256MiB 受限 64 折压测
+```
+
+
 ## 落盘结构与批量处理
 
 * 事实流式入 `facts` 表（Python 侧只保留一个 5000 行批次），建
@@ -129,3 +209,37 @@ python3 -I benchmark/run_benchmark.py
 半开边界（下界含上界不含）、覆盖断裂与相邻拼接、迟到覆盖/结局、
 错误修订（同 ID/revision 异内容拒绝）、极端 int64 与端点溢出、
 输入行序置换不变性、特征/标签来路隔离、失败库清理。
+
+## 切分库输出表
+
+`nodes`（example/entity/fact 三类命名空间）、`sample_info`（锚点+
+标签快照）、`static_edges`（去重的同实体/来路边）、`provenance_refs`
+（逐特征逐修订真实来路）、`alias_edges`（全部时效边含平行边）、
+`folds`（计划）、`assignments`（每折每样本一行，outside 也落库）、
+`source_binding` 与 `input_files`（来源内容指纹与文件哈希）。
+不拷贝特征值、结局与原始事实。
+
+## 切分验收覆盖点
+
+共享事实的不同修订不被合并、时效边四端点（含半开边界）、
+替代路径部分相交的断开/复连、embargo 数值边界与优先级、
+pending 中间点换对手、同名异类编号、多对手选字节序最小、
+平行边生效端点、折序打乱与重复 link_at、无可用验证样本、
+非法输入拒绝、失败后旧库可用、未完成/孤儿来路库拒绝、
+未知折/样本不冒充 outside、来源换库指纹失配、重建逐行确定性。
+
+## 64 折压测实测（RLIMIT_AS=256 MiB）
+
+| 指标 | 实测 |
+| --- | --- |
+| 样本 / 折数 | 120,000 / 64 |
+| 特征来路行 / 别名边 | 1,204,000 / 250,000 |
+| assignment 行数（样本×折） | 7,680,000 |
+| 装配耗时 / 64 折切分耗时 | 约 54s / 约 118s |
+| 峰值 RSS | 约 201 MiB（256 MiB 预算内） |
+| 来路扫描次数 | 1（流式单遍，不按折重读） |
+| 别名边二分次数 / 朴素重扫比较 | 每条 2 次 / 16,000,000 |
+| 共享事实 F_SHARED 度数 | 4,000（=去重样本数，星形未两两展开） |
+| 断连/复连三阶段探针 | 全部 OK；替代到期折恰好放行 100 个簇样本 |
+| 重建确定性 | 全部表逐行一致 |
+
